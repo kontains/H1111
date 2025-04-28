@@ -24,6 +24,7 @@ import logging
 from datetime import datetime
 from tqdm import tqdm
 from diffusers_helper.bucket_tools import find_nearest_bucket
+from wan.configs import WAN_CONFIGS
 
 
 # Add global stop event
@@ -5179,7 +5180,7 @@ with gr.Blocks(
                 # Update the wanx_task dropdown choices to include Fun-Control options
                 wanx_task = gr.Dropdown(
                     label="Task",
-                    choices=["i2v-14B", "i2v-14B-FC", "t2v-14B", "t2v-1.3B", "t2v-14B-FC", "t2v-1.3B-FC", "i2v-1.3B-new"],
+                    choices=["i2v-14B", "i2v-14B-FC", "t2v-14B", "t2v-1.3B", "t2v-14B-FC", "t2v-1.3B-FC", "i2v-1.3B-new", "i2v_14B_FC_v1_1"],
                     value="i2v-14B",
                     info="Select model type. *-FC options enable Fun-Control features"
                 )
