@@ -55,6 +55,7 @@ def process_framepack_video(
     prompt: str,
     negative_prompt: str,
     input_image: str, # Start image path
+    input_video: Optional[str], # <<< Added Video Path Argument
     # --- End Frame Args ---
     input_end_frame: Optional[str], # End image path
     end_frame_influence: str,
@@ -295,6 +296,10 @@ def process_framepack_video(
             "--latent_window_size", str(latent_window_size),
             "--sample_solver", sample_solver, "--output_type", "video", "--attn_mode", attn_mode
         ]
+
+        if input_video and os.path.exists(input_video):
+             command.extend(["--video_path", input_video])
+             print(f"DEBUG: Using input video for V2V: {input_video}")
         if is_f1: command.append("--is_f1")      
         if transformer_path and os.path.exists(transformer_path): command.extend(["--dit", transformer_path.strip()])
         if vae_path and os.path.exists(vae_path): command.extend(["--vae", vae_path.strip()])
@@ -4592,7 +4597,7 @@ with gr.Blocks(
                 # --- Left Column ---
                 with gr.Column():
                     framepack_input_image = gr.Image(label="Input Image (Video Start)", type="filepath")
-                    with gr.Accordion("Optional End Frame Control", open=True):
+                    with gr.Accordion("Optional End Frame Control", open=False):
                         framepack_input_end_frame = gr.Image(label="End Frame Image (Video End)", type="filepath", scale=1)
                         framepack_end_frame_influence = gr.Dropdown(
                             label="End Frame Influence Mode",
@@ -4607,6 +4612,8 @@ with gr.Blocks(
                             info="Influence strength of the end frame (if provided)",
                             visible=False
                         )
+                    with gr.Accordion("Optional Control Video", open=False):
+                        framepack_input_video = gr.Video(label="Input Video (Overrides Start Image for V2V History)", format="mp4", type="filepath", interactive=True, info="Used for V2V if provided.")
 
                     gr.Markdown("### Resolution Options (Choose One)")
                     framepack_target_resolution = gr.Number(
@@ -6055,6 +6062,7 @@ with gr.Blocks(
         inputs=[
             # Standard args
             framepack_prompt, framepack_negative_prompt, framepack_input_image,
+            framepack_input_video,
             # End Frame args
             framepack_input_end_frame, framepack_end_frame_influence, framepack_end_frame_weight,
             # Model Paths
