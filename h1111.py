@@ -4613,7 +4613,7 @@ with gr.Blocks(
                             visible=False
                         )
                     with gr.Accordion("Optional Control Video", open=False):
-                        framepack_input_video = gr.Video(label="Input Video (Overrides Start Image for V2V History)", format="mp4", type="filepath", interactive=True, info="Used for V2V if provided.")
+                        framepack_input_video = gr.Video(label="Input Video (Overrides Start Image for V2V History)", format="mp4", interactive=True, info="Used for V2V if provided.")
 
                     gr.Markdown("### Resolution Options (Choose One)")
                     framepack_target_resolution = gr.Number(
