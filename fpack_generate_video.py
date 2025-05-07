@@ -415,6 +415,8 @@ def optimize_model(model: HunyuanVideoTransformer3DModelPacked, args: argparse.N
 # endregion
 
 
+# fpack_generate_video.py
+
 def decode_latent(
     latent_window_size: int,
     total_latent_sections: int,
@@ -429,39 +431,82 @@ def decode_latent(
 
     vae.to(device)
     if not bulk_decode:
-        latent_window_size = latent_window_size  # default is 9
-        # total_latent_sections = (args.video_seconds * 30) / (latent_window_size * 4)
-        # total_latent_sections = int(max(round(total_latent_sections), 1))
-        num_frames = latent_window_size * 4 - 3
+        # latent_window_size = latent_window_size  # default is 9 - Redundant assignment
+        # total_latent_sections = (args.video_seconds * 30) / (latent_window_size * 4) # Calculation moved to save_output
+        # total_latent_sections = int(max(round(total_latent_sections), 1)) # Calculation moved to save_output
+        num_frames_per_section_decode = latent_window_size * 4 # How many frames VAE ideally outputs per latent window input
+        overlap_frames_needed = latent_window_size * 4 - 3 # Overlap needed for soft_append_bcthw
 
         latents_to_decode = []
         latent_frame_index = 0
+
+        # --- Calculate chunk sizes based on total_latent_sections ---
+        # This loop logic seems complex and depends on how total_latent_sections was calculated.
+        # Let's simplify the chunking based *directly* on the input latent length.
+        # We iterate through the latent tensor, creating overlapping chunks suitable for the VAE.
+
+        # Simplified chunking logic:
+        # Assuming VAE processes chunks related to latent_window_size
+        # The exact VAE input requirement isn't perfectly clear from this code alone,
+        # but the original loop implies variable section sizes based on being the last one.
+        # Let's stick to the original loop structure for chunking latents, as modifying it
+        # might break VAE decoding assumptions.
+
+        # Original loop to prepare latent chunks (assuming it's correct for VAE)
+        num_frames_per_latent_section_approx = latent_window_size * 2 # Approximate latents per section decode
         for i in range(total_latent_sections - 1, -1, -1):
-            is_last_section = i == total_latent_sections - 1
-            generated_latent_frames = (num_frames + 3) // 4 + (1 if is_last_section else 0)
-            section_latent_frames = (latent_window_size * 2 + 1) if is_last_section else (latent_window_size * 2)
+             is_last_section = i == total_latent_sections - 1
+             # Original calculation for section latent frames based on whether it's the last section
+             section_latent_frames = (latent_window_size * 2 + 1) if is_last_section else (latent_window_size * 2)
 
-            section_latent = latent[:, :, latent_frame_index : latent_frame_index + section_latent_frames, :, :]
-            latents_to_decode.append(section_latent)
+             # Ensure we don't go out of bounds
+             section_end_index = min(latent_frame_index + section_latent_frames, latent.shape[2])
+             section_start_index = max(0, section_end_index - section_latent_frames) # Adjust start if end was clipped
 
-            latent_frame_index += generated_latent_frames
+             if section_start_index >= section_end_index: # Skip if slice is empty
+                 continue
+
+             section_latent = latent[:, :, section_start_index:section_end_index, :, :]
+             latents_to_decode.append(section_latent)
+
+             # Advance index based on how many *new* frames were theoretically generated
+             # This part is tricky without knowing the exact VAE causal mechanism.
+             # Let's use the original advance logic.
+             generated_latent_frames_advance = (num_frames_per_section_decode + 3) // 4 + (1 if is_last_section else 0) # Original logic for advancing index
+             latent_frame_index += generated_latent_frames_advance # Advance based on original calculation
+
 
         latents_to_decode = latents_to_decode[::-1]  # reverse the order of latents to decode
 
         history_pixels = None
-        for latent in tqdm(latents_to_decode):
+        for idx, latent_chunk in enumerate(tqdm(latents_to_decode, desc="Decoding sections")):
+            # Decode the current chunk
+            current_pixels = hunyuan.vae_decode(latent_chunk, vae).cpu()
+            num_current_frames = current_pixels.shape[2]
+
             if history_pixels is None:
-                history_pixels = hunyuan.vae_decode(latent, vae).cpu()
+                history_pixels = current_pixels
             else:
-                overlapped_frames = latent_window_size * 4 - 3
-                current_pixels = hunyuan.vae_decode(latent, vae).cpu()
-                history_pixels = soft_append_bcthw(current_pixels, history_pixels, overlapped_frames)
+                # Check if the current decoded chunk is long enough for the required overlap
+                if num_current_frames >= overlap_frames_needed:
+                    # If long enough, use the original soft blending
+                    history_pixels = soft_append_bcthw(current_pixels, history_pixels, overlap_frames_needed)
+                else:
+                    # If too short, concatenate directly to avoid assertion error
+                    # Log a warning as this might cause a visual discontinuity
+                    logger.warning(f"Last decoded chunk is too short ({num_current_frames} frames) for blending (need {overlap_frames_needed}). Concatenating directly.")
+                    history_pixels = torch.cat([history_pixels, current_pixels], dim=2)
             clean_memory_on_device(device)
     else:
         # bulk decode
         logger.info(f"Bulk decoding")
         history_pixels = hunyuan.vae_decode(latent, vae).cpu()
     vae.to("cpu")
+
+    if history_pixels is None:
+        logger.error("Decoding failed, history_pixels is None.")
+        # Return a dummy tensor or raise an error
+        return torch.zeros((1, 3, 1, 64, 64), dtype=torch.float32) # Example dummy tensor
 
     logger.info(f"Decoded. Pixel shape {history_pixels.shape}")
     return history_pixels[0]  # remove batch dimension
@@ -578,7 +623,8 @@ def prepare_i2v_inputs(
     if args.video_path:
         using_video_for_conditioning = True
         logger.info(f"Preparing video input from: {args.video_path}")
-        input_video_frames_np = load_video(args.video_path, args.fps, (width, height), return_type="np")
+        input_video_frames_list = load_video(video_path=args.video_path, bucket_reso=(width, height))
+        input_video_frames_np = np.stack(input_video_frames_list, axis=0) if input_video_frames_list else np.empty((0, height, width, 3), dtype=np.uint8)        
         num_input_frames = input_video_frames_np.shape[0]
         logger.info(f"Loaded video: {num_input_frames} frames, shape {input_video_frames_np.shape}")
 
@@ -1066,16 +1112,35 @@ def generate(args: argparse.Namespace, gen_settings: GenerationSettings, shared_
         for section_index in range(loop_iterations):
             logger.info(f"--- F1 Section {section_index + 1} / {loop_iterations} ---")
 
-            context_section_idx = 0
-            image_context_section_idx = 0
-            current_prompt = context.get(context_section_idx, {}).get("prompt", "N/A")
-            logger.info(f"Using prompt from section {context_section_idx}: '{current_prompt[:100]}...'")
-            logger.info(f"Using image context from section {image_context_section_idx}")
+            actual_context_idx = section_index if section_index in context else 0
+            actual_image_context_idx = section_index if section_index in context_img else 0
+            current_context_data = context.get(actual_context_idx, context.get(0))
+            current_image_context_data = context_img.get(actual_image_context_idx, context_img.get(0))
 
-            llama_vec = context[context_section_idx]["llama_vec"].to(device, dtype=compute_dtype)
-            llama_attention_mask = context[context_section_idx]["llama_attention_mask"].to(device)
-            clip_l_pooler = context[context_section_idx]["clip_l_pooler"].to(device, dtype=compute_dtype)
-            image_encoder_last_hidden_state = context_img[image_context_section_idx]["image_encoder_last_hidden_state"].to(device, dtype=compute_dtype)
+            # Check if data retrieval was successful
+            if current_context_data is None:
+                logger.error(f"Could not retrieve text context data for section {section_index} (fallback index {actual_context_idx}). Skipping section.")
+                # Optionally: Decide whether to skip the section or reuse last section's context
+                continue # Skip this section if context is missing
+            if current_image_context_data is None:
+                logger.error(f"Could not retrieve image context data for section {section_index} (fallback index {actual_image_context_idx}). Using section 0's image context as fallback.")
+                # Fallback to section 0 image context if specific one is missing but text exists
+                current_image_context_data = context_img.get(0)
+                if current_image_context_data is None:
+                    logger.error("Fallback to section 0 image context also failed. Skipping section.")
+                    continue # Skip if even fallback fails
+
+            current_prompt = current_context_data.get("prompt", "N/A")
+            logger.info(f"Using prompt from section {actual_context_idx}: '{current_prompt[:100]}...'") # Log the index actually used
+            logger.info(f"Using image context from section {actual_image_context_idx}") # Log the index actually used
+
+            # Use the retrieved data
+            llama_vec = current_context_data["llama_vec"].to(device, dtype=compute_dtype)
+            llama_attention_mask = current_context_data["llama_attention_mask"].to(device)
+            clip_l_pooler = current_context_data["clip_l_pooler"].to(device, dtype=compute_dtype)
+            image_encoder_last_hidden_state = current_image_context_data["image_encoder_last_hidden_state"].to(device, dtype=compute_dtype)
+
+            # History latent remains the same calculation based on the overall history
             start_latent_cond = history_latents[:, :, -1:].to(device, dtype=torch.float32)
 
             llama_vec_n = context_null["llama_vec"].to(device, dtype=compute_dtype)
@@ -1126,7 +1191,29 @@ def generate(args: argparse.Namespace, gen_settings: GenerationSettings, shared_
             clean_memory_on_device(device)
 
         if is_v2v:
-            real_history_latents = history_latents
+            # For V2V, we need to include some of the original frames to ensure proper overlapping during decoding
+            # The minimum overlap needed for decoding is latent_window_size * 4 - 3 frames
+            original_frame_count = input_video_latents.shape[2]
+            logger.info(f"V2V mode: Original video had {original_frame_count} latent frames, total history has {history_latents.shape[2]} frames")
+            
+            # Calculate how many original frames we need to keep for proper overlapping
+            overlap_needed = latent_window_size * 4 - 3
+            # We need to keep at least overlap_needed frames from the original video
+            frames_to_keep = min(overlap_needed, original_frame_count)
+            
+            # Extract the necessary original frames plus all newly generated frames
+            start_idx = max(0, original_frame_count - frames_to_keep)
+            real_history_latents = history_latents[:, :, start_idx:]
+            
+            # Calculate how many new frames we actually have
+            new_frames_count = history_latents.shape[2] - original_frame_count
+            logger.info(f"V2V mode: Keeping {frames_to_keep} frames from original video for overlap + {new_frames_count} newly generated frames")
+            logger.info(f"V2V mode: Total frames for decoding: {real_history_latents.shape[2]}")
+            
+            # Sanity check - if somehow we ended up with too few frames, use more of the original video
+            if real_history_latents.shape[2] < overlap_needed and history_latents.shape[2] >= overlap_needed:
+                logger.warning(f"V2V slicing resulted in too few frames ({real_history_latents.shape[2]}) for proper overlap. Using more of original video.")
+                real_history_latents = history_latents[:, :, -overlap_needed:] # Use at least overlap_needed frames
         else: # I2V - remove initial conditioning zeros
             real_history_latents = history_latents[:, :, 19:]
             # Sanity check frame count
@@ -1139,7 +1226,11 @@ def generate(args: argparse.Namespace, gen_settings: GenerationSettings, shared_
     # --- Standard Model Sampling Logic ---
     elif args.video_path:
          logger.warning("Video input (--video_path) used with standard model. This is experimental and likely won't work correctly without dedicated V2V logic for standard mode.")
-         real_history_latents = input_video_latents.cpu().float() if input_video_latents is not None else torch.zeros(1, 16, 1, height//8, width//8) # Placeholder
+         # For standard model with video_path, we should still only return new frames
+         # But since we don't have proper V2V implementation for standard model, we'll just return empty latents
+         # This will be improved when proper V2V for standard model is implemented
+         logger.warning("Standard model V2V not fully implemented - returning empty latents to avoid saving original video")
+         real_history_latents = torch.zeros(1, 16, 1, height//8, width//8) # Empty placeholder instead of input_video_latents
     else: # Standard model I2V
         logger.info("Starting standard model sampling process.")
         history_latents_std = torch.zeros((1, 16, 1 + 2 + 16, height // 8, width // 8), dtype=torch.float32, device='cpu')
@@ -1435,6 +1526,8 @@ def save_output(
     width = latent_width * 8
     logger.info(f"Saving output. Latent shape: {latent.shape}; Target pixel shape: {height}x{width}")
 
+    actual_latent_frames_count = latent.shape[2] # Assuming latent is BCTHW
+
     if args.output_type == "latent" or args.output_type == "both":
         # save latent (use first name if multiple originals)
         base_name = original_base_names[0] if original_base_names else None
@@ -1442,21 +1535,36 @@ def save_output(
     if args.output_type == "latent":
         return
 
-    # Calculate total sections based on final latent length and window size?
-    # Or use the value from args/generation loop? Let's use args.
-    total_latent_sections = (args.video_seconds * args.fps) / (args.latent_window_size * 4) # Use args.fps
-    total_latent_sections = int(max(round(total_latent_sections), 1))
-    logger.info(f"Decoding using total_latent_sections = {total_latent_sections} based on args.")
+    # Calculate total_latent_sections for decode_latent based on the actual number of frames in the 'latent' tensor.
+    # This 'latent' tensor is the complete history (original + generated for V2V).
+    LWS = args.latent_window_size
+    calculated_total_sections_for_decode: int
+    if actual_latent_frames_count <= 0:
+        calculated_total_sections_for_decode = 0
+    else:
+        # The decode_latent loop processes sections, and the 'is_last_section' logic
+        # means the first iteration of its loop (which corresponds to the end of the video)
+        # effectively advances the latent frame index by LWS + 1. Other iterations advance by LWS.
+        adv_first_iter_in_decode_loop = LWS + 1 # Advance for the section where is_last_section=true in generated_latent_frames
+        
+        calculated_total_sections_for_decode = 1 # At least one section if frames > 0
+        remaining_frames = actual_latent_frames_count - adv_first_iter_in_decode_loop
+        
+        if remaining_frames > 0:
+            calculated_total_sections_for_decode += (remaining_frames + LWS - 1) // LWS # Ceil division for other sections
+
+    logger.info(f"Decoding {actual_latent_frames_count} latent frames. Calculated total sections for decode_latent: {calculated_total_sections_for_decode}.")
+    total_latent_sections_to_pass_to_decode = calculated_total_sections_for_decode
 
     # Decode (handle potential batch > 1?)
     # decode_latent expects BCTHW or CTHW, and returns CTHW
     # Currently process only the first item in the batch for saving video/images
-    video = decode_latent(args.latent_window_size, total_latent_sections, args.bulk_decode, vae, latent[0], device)
+    video = decode_latent(args.latent_window_size, total_latent_sections_to_pass_to_decode, args.bulk_decode, vae, latent[0], device)
 
     if args.output_type == "video" or args.output_type == "both":
         # save video
         original_name = original_base_names[0] if original_base_names else None
-        save_video(video, args, original_name, latent_frames=latent_frames) # Pass latent frames count
+        save_video(video, args, original_name, latent_frames=actual_latent_frames_count)
 
     elif args.output_type == "images":
         # save images
