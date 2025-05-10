@@ -409,10 +409,10 @@ def optimize_model(model: HunyuanVideoTransformer3DModelPacked, args: argparse.N
 
 def decode_latent(
     latent_window_size: int,
-    total_latent_sections: int, # This will be total_latent_sections_to_pass_to_decode from save_output
+    total_latent_sections: int,
     bulk_decode: bool,
     vae: AutoencoderKLCausal3D,
-    latent: torch.Tensor, # This is the full latent tensor (e.g., latent[0] from save_output)
+    latent: torch.Tensor,
     device: torch.device,
 ) -> torch.Tensor:
     logger.info(f"Decoding video...")
@@ -420,82 +420,43 @@ def decode_latent(
         latent = latent.unsqueeze(0)  # add batch dimension
 
     vae.to(device)
-    history_pixels = None # Initialize to handle case where total_latent_sections might be 0
-
     if not bulk_decode:
-        if total_latent_sections == 0 : # Handle empty latent case
-            logger.warning("decode_latent called with total_latent_sections = 0. Returning empty pixels.")
-             # Ensure vae is moved to cpu if it was on device
-            vae.to("cpu")
-            dummy_h = (latent.shape[3] if latent.ndim==5 else latent.shape[2]) * 8
-            dummy_w = (latent.shape[4] if latent.ndim==5 else latent.shape[3]) * 8
-            return torch.zeros((3, 0, dummy_h, dummy_w), dtype=torch.float32)
-        num_frames = latent_window_size * 4 - 3 # Frames VAE outputs for a standard latent window input
+        latent_window_size = latent_window_size  # default is 9
+        # total_latent_sections = (args.video_seconds * 30) / (latent_window_size * 4)
+        # total_latent_sections = int(max(round(total_latent_sections), 1))
+        num_frames = latent_window_size * 4 - 3
 
         latents_to_decode = []
-        latent_frame_index = 0 # This is an index into the input `latent` tensor's time dimension
+        latent_frame_index = 0
         for i in range(total_latent_sections - 1, -1, -1):
-            is_last_section_in_loop = (i == total_latent_sections - 1) # True for the first iteration of this loop
+            is_last_section = i == total_latent_sections - 1
+            generated_latent_frames = (num_frames + 3) // 4 + (1 if is_last_section else 0)
+            section_latent_frames = (latent_window_size * 2 + 1) if is_last_section else (latent_window_size * 2)
 
-            generated_latent_frames_advance = (num_frames + 3) // 4 + (1 if is_last_section_in_loop else 0)
-            current_section_vae_input_len = (latent_window_size * 2 + 1) if is_last_section_in_loop else (latent_window_size * 2)
-            start_idx = latent_frame_index
-            end_idx = min(latent_frame_index + current_section_vae_input_len, latent.shape[2])
-            
-            if start_idx >= end_idx: # No more valid latents to slice for VAE input
-                logger.warning(f"decode_latent: Ran out of latent frames to slice for VAE input at section i={i}. Loop intended for {total_latent_sections} sections. Latent shape: {latent.shape}")
-                break 
-            
-            section_latent_for_vae = latent[:, :, start_idx : end_idx, :, :]
-            latents_to_decode.append(section_latent_for_vae)
+            section_latent = latent[:, :, latent_frame_index : latent_frame_index + section_latent_frames, :, :]
+            latents_to_decode.append(section_latent)
 
-            latent_frame_index += generated_latent_frames_advance
+            latent_frame_index += generated_latent_frames
 
-        latents_to_decode = latents_to_decode[::-1]  # Reverse to decode in chronological video order
+        latents_to_decode = latents_to_decode[::-1]  # reverse the order of latents to decode
 
-        for idx, latent_chunk in enumerate(tqdm(latents_to_decode, desc="Decoding sections")):
-            # Decode the current chunk
-            current_pixels = hunyuan.vae_decode(latent_chunk, vae).cpu()
-            
+        history_pixels = None
+        for latent in tqdm(latents_to_decode):
             if history_pixels is None:
-                history_pixels = current_pixels
+                history_pixels = hunyuan.vae_decode(latent, vae).cpu()
             else:
                 overlapped_frames = latent_window_size * 4 - 3
-                
-                # Before blending, ensure history_pixels is not empty
-                if history_pixels.shape[2] == 0: # If previous was a dummy due to no frames
-                    history_pixels = current_pixels
-                    logger.warning("History pixels was empty, starting new history with current chunk.")
-                elif current_pixels.shape[2] == 0: # If current chunk is somehow empty
-                    logger.warning("Current pixel chunk is empty, skipping soft_append.")
-                elif current_pixels.shape[2] < overlapped_frames and idx > 0: # only warn if not the first real segment
-                    # This can happen if the very last segment of latents is too short.
-                    logger.warning(
-                        f"Current decoded pixel chunk ({current_pixels.shape[2]} frames) is shorter than "
-                        f"required overlap ({overlapped_frames} frames) for soft blending. "
-                        f"Concatenating directly. This might cause a visual discontinuity."
-                    )
-                    history_pixels = torch.cat([history_pixels, current_pixels], dim=2)
-                else:
-                    history_pixels = soft_append_bcthw(current_pixels, history_pixels, overlapped_frames)
+                current_pixels = hunyuan.vae_decode(latent, vae).cpu()
+                history_pixels = soft_append_bcthw(current_pixels, history_pixels, overlapped_frames)
             clean_memory_on_device(device)
-        # --- End of logic adopted from Version 2 ---
     else:
         # bulk decode
         logger.info(f"Bulk decoding")
         history_pixels = hunyuan.vae_decode(latent, vae).cpu()
-    
     vae.to("cpu")
 
-    if history_pixels is None:
-        logger.error("Decoding failed, history_pixels is None after processing.")
-        # Fallback to a clearly identifiable error state or a minimal tensor
-        dummy_h = (latent.shape[3] if latent.ndim==5 else latent.shape[2]) * 8
-        dummy_w = (latent.shape[4] if latent.ndim==5 else latent.shape[3]) * 8
-        return torch.zeros((3, 1, dummy_h, dummy_w), dtype=torch.float32) # 1 black frame
-
     logger.info(f"Decoded. Pixel shape {history_pixels.shape}")
-    return history_pixels[0]  # remove batch dimension
+    return history_pixels[0] 
 
 
 def prepare_i2v_inputs(
